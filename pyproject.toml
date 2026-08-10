@@ -1,0 +1,15 @@
+[project]
+name = "secretsmgr"
+version = "0.1.0"
+description = "A CLI for managing secrets via the OS keyring"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.12",
+    "keyring>=25",
+]
+
+[project.optional-dependencies]
+file-backend = ["keyrings.alt>=5"]
+
+[project.scripts]
+secretsmgr = "secretsmgr:app"
