@@ -125,48 +125,94 @@ def delete(
         raise typer.Exit(1)
 
 
-@app.command(name="list")
-def list_secrets(
-    service: Annotated[
-        str | None, typer.Option("--service", "-s", help="Service/namespace name.")
-    ] = None,
-) -> None:
-    """List all secret keys for a service.
+def _extract_dump_keychain_blob(line: str) -> str | None:
+    """Extract the string value from one attribute line of `security dump-keychain`.
 
-    Listing is supported on the SecretService backend (Linux) and the
-    file backend (keyrings.alt). Other backends return only the first key.
+    Lines look like ``"acct"<blob>="ping"`` (printable) or
+    ``"acct"<blob>=0x70696E67  "ping"`` (non-printable, hex + quoted repr).
     """
-    svc = _resolve_service(service)
-    backend = keyring.get_keyring()
+    if "=" not in line:
+        return None
+    value = line.split("=", 1)[1].strip()
+    if value.startswith("0x"):
+        # Hex-encoded values are followed by a quoted, possibly-lossy repr.
+        parts = value.split(None, 1)
+        value = parts[1].strip() if len(parts) == 2 else ""
+    if value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    return None
 
-    # Collect the list of backends to check (handle ChainerBackend).
-    backends = []
-    if hasattr(backend, "backends"):
-        backends = backend.backends
-    else:
-        backends = [backend]
+
+def _list_keys_macos(service: str) -> list[str]:
+    """Enumerate all keys for *service* in the macOS Keychain.
+
+    keyring's macOS backend can set/get/delete individual items but has no
+    "list all" API, so we shell out to ``security dump-keychain``, which
+    prints item *attributes* only (not secret values) and does not require
+    unlocking the keychain.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["security", "dump-keychain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError:
+        typer.echo("The 'security' command is not available.", err=True)
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError as e:
+        typer.echo(f"Failed to enumerate Keychain items: {e}", err=True)
+        raise typer.Exit(1)
+
+    keys: list[str] = []
+    svce: str | None = None
+    acct: str | None = None
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if line.startswith("keychain:"):
+            # A new item block is starting — flush the previous one.
+            if svce == service and acct is not None:
+                keys.append(acct)
+            svce = acct = None
+        elif line.startswith('"svce"'):
+            svce = _extract_dump_keychain_blob(line)
+        elif line.startswith('"acct"'):
+            acct = _extract_dump_keychain_blob(line)
+    if svce == service and acct is not None:
+        keys.append(acct)
+
+    return sorted({*keys})
+
+
+def _list_keys(service: str) -> list[str] | None:
+    """Return all keys stored for *service*, or None if listing isn't supported.
+
+    Supported: the SecretService backend (Linux), the file backend
+    (keyrings.alt), and macOS Keychain (via the `security` CLI). Other
+    backends fall back to a single-credential lookup by the caller.
+    """
+    if sys.platform == "darwin":
+        return _list_keys_macos(service)
+
+    backend = keyring.get_keyring()
+    backends = backend.backends if hasattr(backend, "backends") else [backend]
 
     # SecretService backend: search all items in the collection.
     for b in backends:
-        if b.name == "SecretService":
-            from secretstorage import Connection, Collection
-            import dbus
+        if "secretservice" in b.name.lower():
+            import secretstorage
 
-            bus = dbus.SessionBus()
             try:
-                with Connection(bus) as connection:
-                    collection = Collection(connection)
-                    items = collection.search_items({"service": svc})
-                    keys = []
-                    for item in items:
-                        keys.append(item.get_attributes().get("username", "<unknown>"))
-                    keys.sort()
-                    if not keys:
-                        typer.echo(f"No secrets found in service '{svc}'.", err=True)
-                        return
-                    for k in keys:
-                        typer.echo(k)
-                    return
+                connection = secretstorage.dbus_init()
+                items = secretstorage.search_items(connection, {"service": service})
+                keys = [
+                    item.get_attributes().get("username", "<unknown>")
+                    for item in items
+                ]
+                return sorted(keys)
             except Exception as e:
                 typer.echo(f"Failed to list secrets: {e}", err=True)
                 raise typer.Exit(1)
@@ -180,28 +226,40 @@ def list_secrets(
             cfg = configparser.ConfigParser()
             cfg.read(b.file_path)
             # Section name is the escaped service name (dashes → _2D, uppercase).
-            section = escape_for_ini(svc)
+            section = escape_for_ini(service)
             if section not in cfg:
-                typer.echo(f"No secrets found in service '{svc}'.", err=True)
-                return
-            # Keys are lowercased by configparser, so we decode case-insensitively.
-            keys = sorted(cfg[section].keys())
-            if not keys:
-                typer.echo(f"No secrets found in service '{svc}'.", err=True)
-                return
-            for k in keys:
-                # Decode the escape: _2d → - (case-insensitive since configparser
-                # lowercased the keys).
-                decoded = k.replace("_2d", "-")
-                typer.echo(decoded)
-            return
+                return []
+            # Keys are lowercased by configparser; decode case-insensitively.
+            return sorted(k.replace("_2d", "-") for k in cfg[section].keys())
 
-    # Other backends: try get_credential (returns first only, not all).
-    cred = keyring.get_credential(svc, None)
-    if cred is None:
+    return None
+
+
+@app.command(name="list")
+def list_secrets(
+    service: Annotated[
+        str | None, typer.Option("--service", "-s", help="Service/namespace name.")
+    ] = None,
+) -> None:
+    """List all secret keys for a service.
+
+    Listing is supported on macOS Keychain, the SecretService backend
+    (Linux), and the file backend (keyrings.alt). Other backends return
+    only the first key.
+    """
+    svc = _resolve_service(service)
+    keys = _list_keys(svc)
+
+    if keys is None:
+        # Unsupported backend: try get_credential (returns first only, not all).
+        cred = keyring.get_credential(svc, None)
+        keys = [cred.username] if cred is not None else []
+
+    if not keys:
         typer.echo(f"No secrets found in service '{svc}'.", err=True)
         return
-    typer.echo(cred.username)
+    for k in keys:
+        typer.echo(k)
 
 
 # ---------------------------------------------------------------------------
@@ -251,44 +309,11 @@ def _collect_secrets(service: str) -> dict[str, str]:
     Uses the same listing logic as the ``list`` command, then fetches each
     value individually.
     """
-    backend = keyring.get_keyring()
-    backends = backend.backends if hasattr(backend, "backends") else [backend]
-
-    keys: list[str] = []
-
-    # SecretService backend (Linux).
-    for b in backends:
-        if b.name == "SecretService":
-            from secretstorage import Connection, Collection
-            import dbus
-
-            bus = dbus.SessionBus()
-            with Connection(bus) as connection:
-                collection = Collection(connection)
-                items = collection.search_items({"service": service})
-                for item in items:
-                    keys.append(item.get_attributes().get("username", "<unknown>"))
-            break
-
-    # File backend (keyrings.alt).
+    keys = _list_keys(service)
     if not keys:
-        for b in backends:
-            if "file" in b.name.lower():
-                import configparser
-                from keyrings.alt.file import escape_for_ini
-
-                cfg = configparser.ConfigParser()
-                cfg.read(b.file_path)
-                section = escape_for_ini(service)
-                if section in cfg:
-                    keys = [k.replace("_2d", "-") for k in cfg[section].keys()]
-                break
-
-    # Fallback: single credential.
-    if not keys:
+        # Fallback: single credential (unsupported-backend case).
         cred = keyring.get_credential(service, None)
-        if cred is not None:
-            keys = [cred.username]
+        keys = [cred.username] if cred is not None else []
 
     return {k: keyring.get_password(service, k) for k in keys}
 
