@@ -138,12 +138,13 @@ class TestSecretServiceListing:
 class TestMacOSListing:
     """Regression tests for _list_keys_macos (the `security dump-keychain` path)."""
 
+    # Symbolic "svce" tag — the format assumed (wrongly, as the sole case) by
+    # the first cut of this parser.
     SAMPLE_DUMP = """\
 keychain: "/Users/jim/Library/Keychains/login.keychain-db"
 version: 512
 class: "genp"
 attributes:
-    0x00000007 <blob>="secretsmgr"
     "acct"<blob>="ping"
     "svce"<blob>="secretsmgr"
 data:
@@ -166,11 +167,62 @@ data:
 "whatever"
 """
 
+    # Raw-integer service tag — reproduces a real `security dump-keychain`
+    # dump from a SQL-based login.keychain-db (macOS, reported in the wild):
+    # "svce" never appears at all; the service string prints under a bare
+    # hex attribute tag (0x00000007) instead. "acct" still prints
+    # symbolically. This is the format the original parser silently
+    # dropped every item under — it looked only for a line starting with
+    # `"svce"`.
+    SAMPLE_DUMP_RAW_TAG = """\
+keychain: "/Users/jshingler/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="secretsmgr"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="ping"
+    "cdat"<timedate>=0x32303236303831313233333035305A00  "20260811233050Z\\000"
+    "crtr"<uint32>=<NULL>
+data:
+"pong"
+keychain: "/Users/jshingler/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="secretsmgr"
+    "acct"<blob>="otherkey"
+data:
+"otherval"
+keychain: "/Users/jshingler/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="some-other-app"
+    "acct"<blob>="unrelated"
+data:
+"whatever"
+"""
+
     def test_lists_only_matching_service(self):
         """Only items whose svce matches the requested service are returned."""
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
                 stdout=self.SAMPLE_DUMP, returncode=0
+            )
+            keys = _list_keys_macos("secretsmgr")
+
+        assert keys == ["otherkey", "ping"]
+        assert "unrelated" not in keys
+
+    def test_lists_only_matching_service_raw_tag(self):
+        """Same as above, but against a dump where the service attribute
+        prints under a raw hex tag (0x00000007) instead of "svce" — the
+        real-world case that the original parser silently dropped.
+        """
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=self.SAMPLE_DUMP_RAW_TAG, returncode=0
             )
             keys = _list_keys_macos("secretsmgr")
 

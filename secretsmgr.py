@@ -126,16 +126,21 @@ def delete(
 
 
 def _extract_dump_keychain_blob(line: str) -> str | None:
-    """Extract the string value from one attribute line of `security dump-keychain`.
+    """Extract the string value from one <blob> attribute line of
+    `security dump-keychain`, or None if the line isn't a quoted blob value.
 
-    Lines look like ``"acct"<blob>="ping"`` (printable) or
-    ``"acct"<blob>=0x70696E67  "ping"`` (non-printable, hex + quoted repr).
+    Lines look like ``"acct"<blob>="ping"`` (symbolic tag, printable),
+    ``0x00000007 <blob>="secretsmgr"`` (raw integer tag, printable — some
+    macOS versions/keychain formats — notably the SQL-based
+    ``login.keychain-db`` — don't resolve every attribute tag to its 4-char
+    symbolic name, "svce" included), or ``"acct"<blob>=0x70696E67  "ping"``
+    (non-printable, hex-encoded + quoted repr).
     """
-    if "=" not in line:
+    if "<blob>" not in line or "=" not in line:
         return None
     value = line.split("=", 1)[1].strip()
     if value.startswith("0x"):
-        # Hex-encoded values are followed by a quoted, possibly-lossy repr.
+        # Hex-encoded bytes are followed by a quoted, possibly-lossy repr.
         parts = value.split(None, 1)
         value = parts[1].strip() if len(parts) == 2 else ""
     if value.startswith('"') and value.endswith('"'):
@@ -148,8 +153,16 @@ def _list_keys_macos(service: str) -> list[str]:
 
     keyring's macOS backend can set/get/delete individual items but has no
     "list all" API, so we shell out to ``security dump-keychain``, which
-    prints item *attributes* only (not secret values) and does not require
-    unlocking the keychain.
+    prints item *attributes* only (not secret values, and no ``-d`` flag is
+    used so nothing needs to be unlocked/decrypted).
+
+    The service ("svce") attribute isn't reliably printed under its
+    symbolic tag — on some keychain formats it comes out as a raw integer
+    tag instead (see `_extract_dump_keychain_blob`). Rather than depend on
+    which tag it lands under, a block is considered a match for *service*
+    if any of its <blob> attributes *other than* "acct" carries that exact
+    value; the key itself is always read from "acct", which does print
+    symbolically.
     """
     import subprocess
 
@@ -168,21 +181,29 @@ def _list_keys_macos(service: str) -> list[str]:
         raise typer.Exit(1)
 
     keys: list[str] = []
-    svce: str | None = None
     acct: str | None = None
+    service_matched = False
+
+    def flush() -> None:
+        if service_matched and acct is not None:
+            keys.append(acct)
+
     for raw_line in proc.stdout.splitlines():
         line = raw_line.strip()
         if line.startswith("keychain:"):
             # A new item block is starting — flush the previous one.
-            if svce == service and acct is not None:
-                keys.append(acct)
-            svce = acct = None
-        elif line.startswith('"svce"'):
-            svce = _extract_dump_keychain_blob(line)
-        elif line.startswith('"acct"'):
-            acct = _extract_dump_keychain_blob(line)
-    if svce == service and acct is not None:
-        keys.append(acct)
+            flush()
+            acct = None
+            service_matched = False
+            continue
+        value = _extract_dump_keychain_blob(line)
+        if value is None:
+            continue
+        if line.startswith('"acct"'):
+            acct = value
+        elif value == service:
+            service_matched = True
+    flush()
 
     return sorted({*keys})
 
